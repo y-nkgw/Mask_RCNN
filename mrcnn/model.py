@@ -209,11 +209,13 @@ def resnet_graph(input_image, architecture, stage5=False, train_bn=True):
 ############################################################
 #  Proposal Layer
 ############################################################
-
+#Anchor-free RPNに変更
+"""
 def apply_box_deltas_graph(boxes, deltas):
-    """Applies the given deltas to the given boxes.
+    ""Applies the given deltas to the given boxes.
     boxes: [N, (y1, x1, y2, x2)] boxes to update
     deltas: [N, (dy, dx, log(dh), log(dw))] refinements to apply
+    """
     """
     # Convert to y, x, h, w
     height = boxes[:, 2] - boxes[:, 0]
@@ -232,7 +234,33 @@ def apply_box_deltas_graph(boxes, deltas):
     x2 = x1 + width
     result = tf.stack([y1, x1, y2, x2], axis=1, name="apply_box_deltas_out")
     return result
-
+"""
+#reference point座標と差分デルタから推論結果のROIの頂点を求める
+def apply_rf_deltas_graph(ref, deltas):
+    """正規化のために各頂点座標をgammaでわる(r_i/γ)
+    """
+    gamma = 50.
+    # Convert to y, x, h, w
+    height = boxes[:, 2] - boxes[:, 0]
+    width = boxes[:, 3] - boxes[:, 1]
+    center_y = boxes[:, 0] + 0.5 * height
+    center_x = boxes[:, 1] + 0.5 * width
+    # Apply deltas
+    center_y += deltas[:, 0] * height
+    center_x += deltas[:, 1] * width
+    height *= tf.exp(deltas[:, 2])
+    width *= tf.exp(deltas[:, 3])
+    # Convert back to y1, x1, y2, x2
+    y1 = deltas[:, 0] * gamma + ref[:,1]
+    x1 = deltas[:, 0] * gamma + ref[:,0]
+    y2 = deltas[:, 1] * gamma + ref[:,1]
+    x2 = deltas[:, 1] * gamma + ref[:,0]
+    y3 = deltas[:, 2] * gamma + ref[:,1]
+    x3 = deltas[:, 2] * gamma + ref[:,0]
+    y4 = deltas[:, 3] * gamma + ref[:,1]
+    x4 = deltas[:, 3] * gamma + ref[:,0]
+    result = tf.stack([y1, x1, y2, x2, y3, x3, y4, x4], axis=1, name="apply_box_deltas_out")
+    return result
 
 def clip_boxes_graph(boxes, window):
     """
@@ -247,6 +275,10 @@ def clip_boxes_graph(boxes, window):
     x1 = tf.maximum(tf.minimum(x1, wx2), wx1)
     y2 = tf.maximum(tf.minimum(y2, wy2), wy1)
     x2 = tf.maximum(tf.minimum(x2, wx2), wx1)
+    y3 = tf.maximum(tf.minimum(y1, wy2), wy1)
+    x3 = tf.maximum(tf.minimum(x1, wx2), wx1)
+    y4 = tf.maximum(tf.minimum(y2, wy2), wy1)
+    x5 = tf.maximum(tf.minimum(x2, wx2), wx1)
     clipped = tf.concat([y1, x1, y2, x2], axis=1, name="clipped_boxes")
     clipped.set_shape((clipped.shape[0], 4))
     return clipped
@@ -277,10 +309,12 @@ class ProposalLayer(KE.Layer):
         # Box Scores. Use the foreground class confidence. [Batch, num_rois, 1]
         scores = inputs[0][:, :, 1]
         # Box deltas [batch, num_rois, 4]
+        #→Anchor freeにするため [batch, num_rois, 8]
         deltas = inputs[1]
-        deltas = deltas * np.reshape(self.config.RPN_BBOX_STD_DEV, [1, 1, 4])
+#       deltas = deltas * np.reshape(self.config.RPN_BBOX_STD_DEV, [1, 1, 4])
         # Anchors
-        anchors = inputs[2]
+        #Anchor freeにするため [batch, 1, (r_x, r_y))]
+        Anchors = inputs[2]
 
         # Improve performance by trimming to top anchors by score
         # and doing the rest on the smaller subset.
@@ -296,12 +330,13 @@ class ProposalLayer(KE.Layer):
                                     names=["pre_nms_anchors"])
 
         # Apply deltas to anchors to get refined anchors.
-        # [batch, N, (y1, x1, y2, x2)]
+        # [batch, N, (y1, x1, y2, x2, y3, x3, y4, x4)]
         boxes = utils.batch_slice([pre_nms_anchors, deltas],
-                                  lambda x, y: apply_box_deltas_graph(x, y),
+ #                                lambda x, y: apply_box_deltas_graph(x, y),
+                                  lambda x, y: apply_rf_deltas_graph(x, y),
                                   self.config.IMAGES_PER_GPU,
                                   names=["refined_anchors"])
-
+"""０～１にclippingしている。おそらくAnchor freeではいらない？
         # Clip to image boundaries. Since we're in normalized coordinates,
         # clip to 0..1 range. [batch, N, (y1, x1, y2, x2)]
         window = np.array([0, 0, 1, 1], dtype=np.float32)
@@ -309,7 +344,7 @@ class ProposalLayer(KE.Layer):
                                   lambda x: clip_boxes_graph(x, window),
                                   self.config.IMAGES_PER_GPU,
                                   names=["refined_anchors_clipped"])
-
+"""
         # Filter out small boxes
         # According to Xinlei Chen's paper, this reduces detection accuracy
         # for small objects, so we're skipping it.
@@ -376,11 +411,15 @@ class PyramidROIAlign(KE.Layer):
         # Feature Maps. List of feature maps from different level of the
         # feature pyramid. Each is [batch, height, width, channels]
         feature_maps = inputs[2:]
-
+"""Ancho freeに変更
         # Assign each ROI to a level in the pyramid based on the ROI area.
         y1, x1, y2, x2 = tf.split(boxes, 4, axis=2)
         h = y2 - y1
         w = x2 - x1
+"""     # Assign each ROI to a level in the pyramid based on the ROI area.
+        y1, x1, y2, x2, y3, x3 ,y4, x4 = tf.split(boxes, 8, axis=2)
+        h = tf.maximum(y1, y2, y3, y4)-tf.minimum(y1, y2, y3, y4)
+        w = tf.maximum(x1, x2, x3, x4)-tf.minimum(x1, x2, x3, x4)
         # Use shape of first image. Images in a batch must have the same size.
         image_shape = parse_image_meta_graph(image_meta)['image_shape'][0]
         # Equation 1 in the Feature Pyramid Networks paper. Account for
@@ -395,7 +434,9 @@ class PyramidROIAlign(KE.Layer):
         # Loop through levels and apply ROI pooling to each. P2 to P5.
         pooled = []
         box_to_level = []
-        for i, level in enumerate(range(2, 6)):
+        #P4のみ利用するため変更
+#        for i, level in enumerate(range(2, 6)):
+        for i, level in enumerate(3):
             ix = tf.where(tf.equal(roi_level, level))
             level_boxes = tf.gather_nd(boxes, ix)
 
@@ -1679,11 +1720,14 @@ def data_generator(dataset, config, shuffle=True, augment=False, augmentation=No
     # Anchors
     # [anchor_count, (y1, x1, y2, x2)]
     backbone_shapes = compute_backbone_shapes(config, config.IMAGE_SHAPE)
+    """
+    #Anchorは使用しない
     anchors = utils.generate_pyramid_anchors(config.RPN_ANCHOR_SCALES,
                                              config.RPN_ANCHOR_RATIOS,
                                              backbone_shapes,
                                              config.BACKBONE_STRIDES,
                                              config.RPN_ANCHOR_STRIDE)
+  　"""
 
     # Keras requires a generator to run indefinitely.
     while True:
@@ -2594,10 +2638,11 @@ class MaskRCNN():
                 "masks": final_masks,
             })
         return results
+"""　　anchorは使用しない
 
     def get_anchors(self, image_shape):
-        """Returns anchor pyramid for the given image size."""
-        backbone_shapes = compute_backbone_shapes(self.config, image_shape)
+        #Returns anchor pyramid for the given image size.
+       backbone_shapes = compute_backbone_shapes(self.config, image_shape)
         # Cache anchors and reuse if image shape is the same
         if not hasattr(self, "_anchor_cache"):
             self._anchor_cache = {}
@@ -2616,7 +2661,7 @@ class MaskRCNN():
             # Normalize coordinates
             self._anchor_cache[tuple(image_shape)] = utils.norm_boxes(a, image_shape[:2])
         return self._anchor_cache[tuple(image_shape)]
-
+"""
     def ancestor(self, tensor, name, checked=None):
         """Finds the ancestor of a TF tensor in the computation graph.
         tensor: TensorFlow symbolic tensor.
